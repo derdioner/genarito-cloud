@@ -138,11 +138,16 @@ app.get('/logs', (req, res) => {
     });
 });
 
+// Función auxiliar para responder 200 OK en entornos Serverless y VPS
+function sendOk(res, msg = 'ok') {
+    if (!res.headersSent) {
+        res.status(200).json({ status: 'ok', msg });
+    }
+}
+
 // Manejador centralizado para webhooks (acepta POST en /webhook/migo, /webhook y /)
 async function handleWebhook(req, res) {
     recordIncoming(req, 'Incoming webhook');
-    // Respondemos de inmediato a Migo para evitar timeouts de red
-    res.status(200).send({ status: 'ok' });
 
     try {
         console.log("📦 [WEBHOOK INCOMING]:", JSON.stringify(req.body, null, 2));
@@ -154,7 +159,7 @@ async function handleWebhook(req, res) {
         // 🛡️ Ignorar ÚNICAMENTE mensajes que el bot se envió a sí mismo
         if (key.fromMe === true || body.fromMe === true) {
             console.log("ℹ️ Mensaje ignorado: enviado por el propio bot (fromMe=true)");
-            return;
+            return sendOk(res, 'ignored fromMe');
         }
 
         // Obtener número del remitente (soporta múltiples formatos de Migo)
@@ -184,7 +189,7 @@ async function handleWebhook(req, res) {
 
         if (!fromPhone || !rawText) {
             console.log(`⚠️ Salida temprana - Datos incompletos: phone="${fromPhone}", text="${rawText}"`);
-            return;
+            return sendOk(res, 'incomplete data');
         }
 
         console.log(`💬 [BOT] Mensaje validado de ${fromPhone}: "${rawText}"`);
@@ -192,7 +197,7 @@ async function handleWebhook(req, res) {
         if (!db) {
             console.error("❌ Base de datos no conectada");
             await enviarWhatsAppMigo(fromPhone, "Hola, estoy iniciando mi sistema en la nube. Por favor, reenvía tu mensaje en un instante.");
-            return;
+            return sendOk(res, 'db not connected');
         }
 
         // CARGAR O CREAR SESIÓN EN FIRESTORE
@@ -248,8 +253,7 @@ async function handleWebhook(req, res) {
                 const saludos = ['hola', 'buenos dias', 'buenos días', 'buenas', 'que tal', 'qué tal', 'buenas tardes', 'buenas noches', 'genarito', 'buen dia', 'buen día'];
                 if (saludos.includes(inputClean)) {
                     const saludoNuevoDia = `¡Hola, Sr(a). *${session.name}*! ☀️ Que tenga un buen día.\n\nSoy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera. ¿En qué le puedo ayudar hoy?\n\nPuede consultarme sobre *horarios*, *tutores*, consultar la *asistencia* de su hijo(a) o registrar una *justificación*.`;
-                    await enviarWhatsAppMigo(fromPhone, saludoNuevoDia);
-                    return;
+                    await enviarWhatsAppMigo(fromPhone, saludoNuevoDia); sendOk(res);
                 }
             } else {
                 session = { state: 'START', phone: fromPhone, lastActiveDate: todayDateStr };
@@ -278,24 +282,21 @@ async function handleWebhook(req, res) {
                 kidsList: admin.firestore.FieldValue.delete(),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
-            await enviarWhatsAppMigo(fromPhone, "✅ Trámite cancelado. He regresado al menú principal. ¿En qué más puedo ayudarte?");
-            return;
+            await enviarWhatsAppMigo(fromPhone, "✅ Trámite cancelado. He regresado al menú principal. ¿En qué más puedo ayudarte?"); sendOk(res);
         }
 
         // --- ESTADO 1: SOLICITAR DNI ---
         if (session.state === 'START') {
             const welcomeMsg = "¡Hola! 🛡️ Soy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera.\n\nPara ayudarte con cualquier trámite o información, por favor bríndame tu número de **DNI**.";
             await enviarWhatsAppMigo(fromPhone, welcomeMsg);
-            await sessionRef.set({ state: 'AWAITING_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-            return;
+            await sessionRef.set({ state: 'AWAITING_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() }); sendOk(res);
         }
 
         // --- ESTADO 2: VALIDAR DNI CON RENIEC (MIGO) ---
         if (session.state === 'AWAITING_DNI') {
             const dni = rawText.trim().replace(/\D/g, '');
             if (dni.length !== 8) {
-                await enviarWhatsAppMigo(fromPhone, "⚠️ El DNI debe tener 8 dígitos. Por favor, envíalo de nuevo.");
-                return;
+                await enviarWhatsAppMigo(fromPhone, "⚠️ El DNI debe tener 8 dígitos. Por favor, envíalo de nuevo."); sendOk(res);
             }
 
             const dniRes = await fetch(`https://api.migo.pe/api/v2/dni/${dni}`, {
@@ -323,8 +324,7 @@ async function handleWebhook(req, res) {
                 });
             } else {
                 await enviarWhatsAppMigo(fromPhone, "❌ No pudimos validar ese DNI. Por favor, asegúrate de que sea correcto e inténtalo de nuevo.");
-            }
-            return;
+            } sendOk(res);
         }
 
         // --- ESTADO 3: ATENCIÓN CON IA (GEMINI) ---
@@ -362,8 +362,7 @@ async function handleWebhook(req, res) {
                     state: 'AWAITING_JUSTIFICATION_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
-                await enviarWhatsAppMigo(fromPhone, "Perfecto. 📝 Vamos a registrar una justificación.\n\nPor favor, bríndame el **DNI del estudiante** que deseas justificar:");
-                return;
+                await enviarWhatsAppMigo(fromPhone, "Perfecto. 📝 Vamos a registrar una justificación.\n\nPor favor, bríndame el **DNI del estudiante** que deseas justificar:"); sendOk(res);
             }
 
             if (rawText.toLowerCase().includes('asistencia') || rawText.toLowerCase().includes('asistio') || rawText.toLowerCase().includes('asistió')) {
@@ -371,8 +370,7 @@ async function handleWebhook(req, res) {
                     state: 'AWAITING_ATTENDANCE_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
-                await enviarWhatsAppMigo(fromPhone, "Perfecto. 🛡️ Para consultar la asistencia, por favor bríndame el **DNI del estudiante**:");
-                return;
+                await enviarWhatsAppMigo(fromPhone, "Perfecto. 🛡️ Para consultar la asistencia, por favor bríndame el **DNI del estudiante**:"); sendOk(res);
             }
 
             const prompt = `
@@ -431,8 +429,7 @@ async function handleWebhook(req, res) {
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
 
-            await enviarWhatsAppMigo(fromPhone, responseAI);
-            return;
+            await enviarWhatsAppMigo(fromPhone, responseAI); sendOk(res);
         }
 
         // --- FLUJO DE JUSTIFICACIONES ---
@@ -452,8 +449,7 @@ async function handleWebhook(req, res) {
             }
 
             if (studentSnap.empty) {
-                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente.");
-                return;
+                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente."); sendOk(res);
             }
 
             const s = studentSnap.docs[0].data();
@@ -471,8 +467,7 @@ async function handleWebhook(req, res) {
             }, { merge: true });
 
             const msj = `He encontrado a:\n👤 *${studentName}*\n🎓 *${studentGrade} "${studentSection}"*\n\n¿Es correcto? (Responde con **Sí** o **No**)`;
-            await enviarWhatsAppMigo(fromPhone, msj);
-            return;
+            await enviarWhatsAppMigo(fromPhone, msj); sendOk(res);
         }
 
         if (session.state === 'CONFIRMING_JUSTIFICATION_STUDENT') {
@@ -489,8 +484,7 @@ async function handleWebhook(req, res) {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
                 await enviarWhatsAppMigo(fromPhone, "Entendido. Por favor, bríndame el **DNI correcto** del estudiante:");
-            }
-            return;
+            } sendOk(res);
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_DATE') {
@@ -524,8 +518,7 @@ async function handleWebhook(req, res) {
                 justificationDate: targetDate,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
-            await enviarWhatsAppMigo(fromPhone, `Entendido, para el día **${targetDate}**. Ahora, por favor escribe el **motivo** de la inasistencia:`);
-            return;
+            await enviarWhatsAppMigo(fromPhone, `Entendido, para el día **${targetDate}**. Ahora, por favor escribe el **motivo** de la inasistencia:`); sendOk(res);
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_REASON') {
@@ -535,8 +528,7 @@ async function handleWebhook(req, res) {
                 justificationReason: reason,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
-            await enviarWhatsAppMigo(fromPhone, "✅ Motivo registrado. Por último, si tienes una **foto de la evidencia** (receta médica, constancia, etc.), envíala ahora.\n\nSi no tienes una foto, solo escribe la palabra: **Listo**.");
-            return;
+            await enviarWhatsAppMigo(fromPhone, "✅ Motivo registrado. Por último, si tienes una **foto de la evidencia** (receta médica, constancia, etc.), envíala ahora.\n\nSi no tienes una foto, solo escribe la palabra: **Listo**."); sendOk(res);
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_EVIDENCE') {
@@ -567,8 +559,7 @@ async function handleWebhook(req, res) {
             }, { merge: true });
 
             const msjFinal = `⭐ ¡Listo! Hemos recibido la justificación de *${session.targetStudentName}*.\n\nLa Coordinación de TOE revisará la información. Te avisaremos por este medio cuando sea aprobada. 🛡️`;
-            await enviarWhatsAppMigo(fromPhone, msjFinal);
-            return;
+            await enviarWhatsAppMigo(fromPhone, msjFinal); sendOk(res);
         }
 
         // --- FLUJO DE CONSULTA DE ASISTENCIA ---
@@ -586,8 +577,7 @@ async function handleWebhook(req, res) {
             }
 
             if (studentSnap.empty) {
-                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente.");
-                return;
+                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente."); sendOk(res);
             }
 
             const s = studentSnap.docs[0].data();
@@ -600,8 +590,7 @@ async function handleWebhook(req, res) {
             }, { merge: true });
 
             const msj = `He encontrado a: *${studentName}*.\n\n¿Qué información deseas?\n\n1. Ver reporte de asistencia QR (Hoy/Ayer).\n2. Ayuda para instalar la App en mi celular.`;
-            await enviarWhatsAppMigo(fromPhone, msj);
-            return;
+            await enviarWhatsAppMigo(fromPhone, msj); sendOk(res);
         }
 
         if (session.state === 'AWAITING_ATTENDANCE_OPTION') {
@@ -660,8 +649,7 @@ async function handleWebhook(req, res) {
                 await sessionRef.set({ state: 'VERIFIED' }, { merge: true });
             } else {
                 await enviarWhatsAppMigo(fromPhone, "⚠️ Por favor, elige una opción válida: *1* para asistencia o *2* para ayuda con la App.");
-            }
-            return;
+            } sendOk(res);
         }
 
     } catch (error) {
