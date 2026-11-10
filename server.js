@@ -100,6 +100,21 @@ async function enviarWhatsAppMigo(phone, message) {
     }
 }
 
+// Registro en memoria de últimas peticiones para diagnóstico en tiempo real
+const requestLogs = [];
+
+function recordIncoming(req, note = '') {
+    const entry = {
+        time: new Date().toLocaleTimeString('es-PE', { timeZone: 'America/Lima' }),
+        method: req.method,
+        url: req.originalUrl || req.url,
+        body: req.body,
+        note: note
+    };
+    requestLogs.unshift(entry);
+    if (requestLogs.length > 50) requestLogs.pop();
+}
+
 // ==========================================
 //   RUTAS DE SALUD Y VERIFICACIÓN
 // ==========================================
@@ -116,8 +131,16 @@ app.get('/health', (req, res) => {
     res.send("OK");
 });
 
+app.get('/logs', (req, res) => {
+    res.json({
+        total: requestLogs.length,
+        logs: requestLogs
+    });
+});
+
 // Manejador centralizado para webhooks (acepta POST en /webhook/migo, /webhook y /)
 async function handleWebhook(req, res) {
+    recordIncoming(req, 'Incoming webhook');
     // Respondemos de inmediato a Migo para evitar timeouts de red
     res.status(200).send({ status: 'ok' });
 
@@ -414,13 +437,18 @@ async function handleWebhook(req, res) {
 
         // --- FLUJO DE JUSTIFICACIONES ---
         if (session.state === 'AWAITING_JUSTIFICATION_DNI') {
-            const dni = rawText.trim();
+            const dni = rawText.trim().replace(/\D/g, '');
             console.log(`🔍 Buscando estudiante DNI: ${dni}`);
 
-            let studentSnap = await db.collection('students').where('id', '==', dni).get();
+            let studentSnap = await db.collection('students').where('studentDni', '==', dni).get();
+            if (studentSnap.empty) studentSnap = await db.collection('students').where('dni', '==', dni).get();
+            if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dni).get();
             if (studentSnap.empty) {
                 const dniNum = parseInt(dni);
-                if (!isNaN(dniNum)) studentSnap = await db.collection('students').where('id', '==', dniNum).get();
+                if (!isNaN(dniNum)) {
+                    studentSnap = await db.collection('students').where('studentDni', '==', dniNum).get();
+                    if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dniNum).get();
+                }
             }
 
             if (studentSnap.empty) {
@@ -429,16 +457,20 @@ async function handleWebhook(req, res) {
             }
 
             const s = studentSnap.docs[0].data();
+            const studentName = s.studentName || s.name || s.n || "Estudiante";
+            const studentGrade = s.grade || s.g || "";
+            const studentSection = s.section || s.s || "";
+
             await sessionRef.set({ 
                 state: 'CONFIRMING_JUSTIFICATION_STUDENT',
                 targetStudentDni: dni,
-                targetStudentName: s.n,
-                targetStudentGrade: s.g,
-                targetStudentSection: s.s,
+                targetStudentName: studentName,
+                targetStudentGrade: studentGrade,
+                targetStudentSection: studentSection,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
 
-            const msj = `He encontrado a:\n👤 *${s.n}*\n🎓 *${s.g}° "${s.s}"*\n\n¿Es correcto? (Responde con **Sí** o **No**)`;
+            const msj = `He encontrado a:\n👤 *${studentName}*\n🎓 *${studentGrade} "${studentSection}"*\n\n¿Es correcto? (Responde con **Sí** o **No**)`;
             await enviarWhatsAppMigo(fromPhone, msj);
             return;
         }
@@ -542,10 +574,15 @@ async function handleWebhook(req, res) {
         // --- FLUJO DE CONSULTA DE ASISTENCIA ---
         if (session.state === 'AWAITING_ATTENDANCE_DNI') {
             const dni = rawText.trim().replace(/\D/g, '');
-            let studentSnap = await db.collection('students').where('id', '==', dni).get();
+            let studentSnap = await db.collection('students').where('studentDni', '==', dni).get();
+            if (studentSnap.empty) studentSnap = await db.collection('students').where('dni', '==', dni).get();
+            if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dni).get();
             if (studentSnap.empty) {
                 const dniNum = parseInt(dni);
-                if (!isNaN(dniNum)) studentSnap = await db.collection('students').where('id', '==', dniNum).get();
+                if (!isNaN(dniNum)) {
+                    studentSnap = await db.collection('students').where('studentDni', '==', dniNum).get();
+                    if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dniNum).get();
+                }
             }
 
             if (studentSnap.empty) {
@@ -554,14 +591,15 @@ async function handleWebhook(req, res) {
             }
 
             const s = studentSnap.docs[0].data();
+            const studentName = s.studentName || s.name || s.n || "Estudiante";
             await sessionRef.set({ 
                 state: 'AWAITING_ATTENDANCE_OPTION',
                 targetStudentDni: dni,
-                targetStudentName: s.n,
+                targetStudentName: studentName,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
 
-            const msj = `He encontrado a: *${s.n}*.\n\n¿Qué información deseas?\n\n1. Ver reporte de asistencia QR (Hoy/Ayer).\n2. Ayuda para instalar la App en mi celular.`;
+            const msj = `He encontrado a: *${studentName}*.\n\n¿Qué información deseas?\n\n1. Ver reporte de asistencia QR (Hoy/Ayer).\n2. Ayuda para instalar la App en mi celular.`;
             await enviarWhatsAppMigo(fromPhone, msj);
             return;
         }
@@ -632,11 +670,16 @@ async function handleWebhook(req, res) {
 }
 
 // Escuchar en todas las variantes posibles de endpoint
-app.post('/webhook/migo', handleWebhook);
-app.post('/webhook', handleWebhook);
+app.all('/webhook/migo', handleWebhook);
+app.all('/webhook', handleWebhook);
+app.all('/api/webhook', handleWebhook);
 app.post('/', handleWebhook);
 
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor Genarito Cloud escuchando en el puerto ${PORT}`);
-    console.log(`📡 Endpoints habilitados: /webhook/migo, /webhook, /`);
-});
+if (!process.env.VERCEL) {
+    app.listen(PORT, () => {
+        console.log(`🚀 Servidor Genarito Cloud escuchando en el puerto ${PORT}`);
+        console.log(`📡 Endpoints habilitados: /webhook/migo, /webhook, /api/webhook, /`);
+    });
+}
+
+module.exports = app;
