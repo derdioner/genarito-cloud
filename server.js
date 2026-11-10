@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // --- CONFIGURACIÓN DE VARIABLES DE ENTORNO (0 COSTO) ---
@@ -116,31 +116,34 @@ app.get('/health', (req, res) => {
     res.send("OK");
 });
 
-// ==========================================
-//   WEBHOOK PRINCIPAL DE MIGO (WHATSAPP)
-// ==========================================
-app.post('/webhook/migo', async (req, res) => {
+// Manejador centralizado para webhooks (acepta POST en /webhook/migo, /webhook y /)
+async function handleWebhook(req, res) {
+    // Respondemos de inmediato a Migo para evitar timeouts de red
+    res.status(200).send({ status: 'ok' });
+
     try {
         console.log("📦 [WEBHOOK INCOMING]:", JSON.stringify(req.body, null, 2));
 
         const body = req.body || {};
         const data = body.data || {};
-        const key = data.key || {};
+        const key = data.key || body.key || {};
 
-        // Ignorar mensajes salientes (enviados por el propio bot)
-        if (key.fromMe === true || body.status) {
-            return res.send({ status: 'ok', msg: 'Ignored outbound message' });
+        // 🛡️ Ignorar ÚNICAMENTE mensajes que el bot se envió a sí mismo
+        if (key.fromMe === true || body.fromMe === true) {
+            console.log("ℹ️ Mensaje ignorado: enviado por el propio bot (fromMe=true)");
+            return;
         }
 
-        // Obtener número del remitente
+        // Obtener número del remitente (soporta múltiples formatos de Migo)
         let fromPhone = "";
         if (key.remoteJid) fromPhone = key.remoteJid;
-        else if (body.number) fromPhone = body.number;
         else if (body.from) fromPhone = body.from;
-        else if (body.data && body.data.from) fromPhone = body.data.from;
+        else if (body.number) fromPhone = body.number;
+        else if (body.phone) fromPhone = body.phone;
+        else if (data.from) fromPhone = data.from;
         else if (body.sender) fromPhone = body.sender;
 
-        // Extraer texto
+        // Extraer texto del mensaje
         const msg = body.message || data.message || {};
         let rawText = body.text || body.body || body.message || msg.conversation || 
                       (msg.extendedTextMessage && msg.extendedTextMessage.text) || 
@@ -158,18 +161,18 @@ app.post('/webhook/migo', async (req, res) => {
 
         if (!fromPhone || !rawText) {
             console.log(`⚠️ Salida temprana - Datos incompletos: phone="${fromPhone}", text="${rawText}"`);
-            return res.send({ status: 'ok', msg: 'No readable data' });
+            return;
         }
 
-        console.log(`💬 [BOT] Mensaje validado de ${fromPhone}: ${rawText}`);
+        console.log(`💬 [BOT] Mensaje validado de ${fromPhone}: "${rawText}"`);
 
         if (!db) {
             console.error("❌ Base de datos no conectada");
             await enviarWhatsAppMigo(fromPhone, "Hola, estoy iniciando mi sistema en la nube. Por favor, reenvía tu mensaje en un instante.");
-            return res.send({ status: 'ok' });
+            return;
         }
 
-        // CARGAR O CREAR SESIÓN
+        // CARGAR O CREAR SESIÓN EN FIRESTORE
         const sessionRef = db.collection('bot_sessions').doc(fromPhone);
         const sessionDoc = await sessionRef.get();
         let session = sessionDoc.exists ? sessionDoc.data() : { state: 'START', phone: fromPhone };
@@ -223,7 +226,7 @@ app.post('/webhook/migo', async (req, res) => {
                 if (saludos.includes(inputClean)) {
                     const saludoNuevoDia = `¡Hola, Sr(a). *${session.name}*! ☀️ Que tenga un buen día.\n\nSoy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera. ¿En qué le puedo ayudar hoy?\n\nPuede consultarme sobre *horarios*, *tutores*, consultar la *asistencia* de su hijo(a) o registrar una *justificación*.`;
                     await enviarWhatsAppMigo(fromPhone, saludoNuevoDia);
-                    return res.send({ status: 'ok' });
+                    return;
                 }
             } else {
                 session = { state: 'START', phone: fromPhone, lastActiveDate: todayDateStr };
@@ -253,7 +256,7 @@ app.post('/webhook/migo', async (req, res) => {
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
             await enviarWhatsAppMigo(fromPhone, "✅ Trámite cancelado. He regresado al menú principal. ¿En qué más puedo ayudarte?");
-            return res.send({ status: 'ok' });
+            return;
         }
 
         // --- ESTADO 1: SOLICITAR DNI ---
@@ -261,7 +264,7 @@ app.post('/webhook/migo', async (req, res) => {
             const welcomeMsg = "¡Hola! 🛡️ Soy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera.\n\nPara ayudarte con cualquier trámite o información, por favor bríndame tu número de **DNI**.";
             await enviarWhatsAppMigo(fromPhone, welcomeMsg);
             await sessionRef.set({ state: 'AWAITING_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-            return res.send({ status: 'ok' });
+            return;
         }
 
         // --- ESTADO 2: VALIDAR DNI CON RENIEC (MIGO) ---
@@ -269,7 +272,7 @@ app.post('/webhook/migo', async (req, res) => {
             const dni = rawText.trim().replace(/\D/g, '');
             if (dni.length !== 8) {
                 await enviarWhatsAppMigo(fromPhone, "⚠️ El DNI debe tener 8 dígitos. Por favor, envíalo de nuevo.");
-                return res.send({ status: 'ok' });
+                return;
             }
 
             const dniRes = await fetch(`https://api.migo.pe/api/v2/dni/${dni}`, {
@@ -298,13 +301,12 @@ app.post('/webhook/migo', async (req, res) => {
             } else {
                 await enviarWhatsAppMigo(fromPhone, "❌ No pudimos validar ese DNI. Por favor, asegúrate de que sea correcto e inténtalo de nuevo.");
             }
-            return res.send({ status: 'ok' });
+            return;
         }
 
         // --- ESTADO 3: ATENCIÓN CON IA (GEMINI) ---
         if (session.state === 'VERIFIED') {
             
-            // Actualizar caché cada 1 hora
             if (Date.now() - aiMemoryCache.lastFetch > 3600000) {
                 let staffText = "TUTORES 2026:\n";
                 const staffSnap = await db.collection('staff_assignments').get();
@@ -332,27 +334,24 @@ app.post('/webhook/migo', async (req, res) => {
                 console.log("🔄 Caché Global de IA actualizado desde Firestore.");
             }
 
-            // Justificaciones
             if (rawText.toLowerCase().includes('justificar') || rawText.toLowerCase().includes('justificación') || rawText.toLowerCase().includes('justificacion')) {
                 await sessionRef.set({ 
                     state: 'AWAITING_JUSTIFICATION_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
                 await enviarWhatsAppMigo(fromPhone, "Perfecto. 📝 Vamos a registrar una justificación.\n\nPor favor, bríndame el **DNI del estudiante** que deseas justificar:");
-                return res.send({ status: 'ok' });
+                return;
             }
 
-            // Asistencia
             if (rawText.toLowerCase().includes('asistencia') || rawText.toLowerCase().includes('asistio') || rawText.toLowerCase().includes('asistió')) {
                 await sessionRef.set({ 
                     state: 'AWAITING_ATTENDANCE_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
                 await enviarWhatsAppMigo(fromPhone, "Perfecto. 🛡️ Para consultar la asistencia, por favor bríndame el **DNI del estudiante**:");
-                return res.send({ status: 'ok' });
+                return;
             }
 
-            // Prompt de Sistema para Gemini AI
             const prompt = `
                 Eres *Genarito*, el Asistente Virtual oficial de la I.E.E. Genaro Herrera (IEE G.H.).
                 Tu objetivo es ayudar a padres y alumnos con información exacta sobre horarios, docentes y trámites.
@@ -410,7 +409,7 @@ app.post('/webhook/migo', async (req, res) => {
             }, { merge: true });
 
             await enviarWhatsAppMigo(fromPhone, responseAI);
-            return res.send({ status: 'ok' });
+            return;
         }
 
         // --- FLUJO DE JUSTIFICACIONES ---
@@ -426,7 +425,7 @@ app.post('/webhook/migo', async (req, res) => {
 
             if (studentSnap.empty) {
                 await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente.");
-                return res.send({ status: 'ok' });
+                return;
             }
 
             const s = studentSnap.docs[0].data();
@@ -441,7 +440,7 @@ app.post('/webhook/migo', async (req, res) => {
 
             const msj = `He encontrado a:\n👤 *${s.n}*\n🎓 *${s.g}° "${s.s}"*\n\n¿Es correcto? (Responde con **Sí** o **No**)`;
             await enviarWhatsAppMigo(fromPhone, msj);
-            return res.send({ status: 'ok' });
+            return;
         }
 
         if (session.state === 'CONFIRMING_JUSTIFICATION_STUDENT') {
@@ -459,7 +458,7 @@ app.post('/webhook/migo', async (req, res) => {
                 }, { merge: true });
                 await enviarWhatsAppMigo(fromPhone, "Entendido. Por favor, bríndame el **DNI correcto** del estudiante:");
             }
-            return res.send({ status: 'ok' });
+            return;
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_DATE') {
@@ -494,7 +493,7 @@ app.post('/webhook/migo', async (req, res) => {
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
             await enviarWhatsAppMigo(fromPhone, `Entendido, para el día **${targetDate}**. Ahora, por favor escribe el **motivo** de la inasistencia:`);
-            return res.send({ status: 'ok' });
+            return;
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_REASON') {
@@ -505,7 +504,7 @@ app.post('/webhook/migo', async (req, res) => {
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
             await enviarWhatsAppMigo(fromPhone, "✅ Motivo registrado. Por último, si tienes una **foto de la evidencia** (receta médica, constancia, etc.), envíala ahora.\n\nSi no tienes una foto, solo escribe la palabra: **Listo**.");
-            return res.send({ status: 'ok' });
+            return;
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_EVIDENCE') {
@@ -537,7 +536,7 @@ app.post('/webhook/migo', async (req, res) => {
 
             const msjFinal = `⭐ ¡Listo! Hemos recibido la justificación de *${session.targetStudentName}*.\n\nLa Coordinación de TOE revisará la información. Te avisaremos por este medio cuando sea aprobada. 🛡️`;
             await enviarWhatsAppMigo(fromPhone, msjFinal);
-            return res.send({ status: 'ok' });
+            return;
         }
 
         // --- FLUJO DE CONSULTA DE ASISTENCIA ---
@@ -551,7 +550,7 @@ app.post('/webhook/migo', async (req, res) => {
 
             if (studentSnap.empty) {
                 await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente.");
-                return res.send({ status: 'ok' });
+                return;
             }
 
             const s = studentSnap.docs[0].data();
@@ -564,7 +563,7 @@ app.post('/webhook/migo', async (req, res) => {
 
             const msj = `He encontrado a: *${s.n}*.\n\n¿Qué información deseas?\n\n1. Ver reporte de asistencia QR (Hoy/Ayer).\n2. Ayuda para instalar la App en mi celular.`;
             await enviarWhatsAppMigo(fromPhone, msj);
-            return res.send({ status: 'ok' });
+            return;
         }
 
         if (session.state === 'AWAITING_ATTENDANCE_OPTION') {
@@ -624,18 +623,20 @@ app.post('/webhook/migo', async (req, res) => {
             } else {
                 await enviarWhatsAppMigo(fromPhone, "⚠️ Por favor, elige una opción válida: *1* para asistencia o *2* para ayuda con la App.");
             }
-            return res.send({ status: 'ok' });
+            return;
         }
 
-        res.send({ status: 'ok' });
-
     } catch (error) {
-        console.error('❌ Error Webhook:', error.message);
-        res.status(500).send(error.message);
+        console.error('❌ Error en procesamiento de Webhook:', error.message);
     }
-});
+}
+
+// Escuchar en todas las variantes posibles de endpoint
+app.post('/webhook/migo', handleWebhook);
+app.post('/webhook', handleWebhook);
+app.post('/', handleWebhook);
 
 app.listen(PORT, () => {
     console.log(`🚀 Servidor Genarito Cloud escuchando en el puerto ${PORT}`);
-    console.log(`📡 Endpoint del webhook: /webhook/migo`);
+    console.log(`📡 Endpoints habilitados: /webhook/migo, /webhook, /`);
 });
