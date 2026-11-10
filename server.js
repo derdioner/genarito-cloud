@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const MIGO_INSTANCE = process.env.MIGO_INSTANCE || "eea35323-c978-443c-b00d-6ba5ee3ddc9b"; // Genarito: 947836063
 const MIGO_API_KEY = process.env.MIGO_API_KEY || "EB08E3C1-0DF4-48DD-9EB5-19D26053D94A";
 const MIGO_DNI_TOKEN = process.env.MIGO_DNI_TOKEN || "CSqZeeppmaJm4sxZUsSIUerIcz61PPFnmuOsWyq6GSybBWf0cN0wW7QKaF1u";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCv0eXHXTr6rf9cqRDuI79P5CZJngXcEXE";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
 // --- INICIALIZACIÓN DE FIREBASE (PROYECTO: iee-genaro-herrera) ---
 try {
@@ -47,6 +47,9 @@ const db = admin.apps.length ? admin.firestore() : null;
 // Caché de contexto para no saturar lecturas en Firestore
 let aiMemoryCache = {
     compiledContext: "",
+    staffList: [],
+    feesList: [],
+    schedulesList: [],
     lastFetch: 0
 };
 
@@ -122,7 +125,7 @@ app.get('/', (req, res) => {
     res.json({
         status: "online",
         name: "Genarito Cloud Assistant - I.E.E. Genaro Herrera",
-        platform: "Render Free Tier (0 Cost)",
+        platform: "Vercel Serverless (0 Cost)",
         time: new Date().toISOString()
     });
 });
@@ -142,6 +145,52 @@ app.get('/logs', (req, res) => {
 function sendOk(res, msg = 'ok') {
     if (!res.headersSent) {
         res.status(200).json({ status: 'ok', msg });
+    }
+}
+
+// Actualizar caché de Firestore para tutores, tarifario y horarios
+async function refreshCacheIfNeeded() {
+    if (!db) return;
+    if (Date.now() - aiMemoryCache.lastFetch < 3600000 && aiMemoryCache.compiledContext) return;
+
+    try {
+        let staffText = "TUTORES 2026:\n";
+        const staffList = [];
+        const staffSnap = await db.collection('staff_assignments').get();
+        staffSnap.forEach(d => {
+            const t = d.data();
+            staffList.push(t);
+            staffText += `${t.grade}${t.section}: ${t.teacherName} (${t.phone || 'Sin número'})\n`;
+        });
+
+        let feesText = "\nCOSTOS DE TRÁMITES (TARIFARIO 2026):\n";
+        const feesList = [];
+        const feesSnap = await db.collection('administrative_fees').get();
+        feesSnap.forEach(d => {
+            const f = d.data();
+            feesList.push(f);
+            feesText += `- ${f.name}: S/ ${f.price}. ${f.notes || ''}\n`;
+        });
+
+        let schedText = "\nHORARIOS ACADÉMICOS (PROFESORES POR AULA):\n";
+        const schedulesList = [];
+        const schedSnap = await db.collection('schedules').get();
+        schedSnap.forEach(d => {
+            const s = d.data();
+            schedulesList.push(s);
+            schedText += `${s.grade}${s.section} | Curso: ${s.subject} -> Docente: ${s.teacherName}\n`;
+        });
+
+        aiMemoryCache = {
+            compiledContext: staffText + feesText + schedText,
+            staffList,
+            feesList,
+            schedulesList,
+            lastFetch: Date.now()
+        };
+        console.log("🔄 Caché Global actualizado desde Firestore.");
+    } catch (e) {
+        console.error("⚠️ Error actualizando caché:", e.message);
     }
 }
 
@@ -248,13 +297,6 @@ async function handleWebhook(req, res) {
                     kidsList: admin.firestore.FieldValue.delete(),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 }, { merge: true });
-
-                const inputClean = rawText.trim().toLowerCase();
-                const saludos = ['hola', 'buenos dias', 'buenos días', 'buenas', 'que tal', 'qué tal', 'buenas tardes', 'buenas noches', 'genarito', 'buen dia', 'buen día'];
-                if (saludos.includes(inputClean)) {
-                    const saludoNuevoDia = `¡Hola, Sr(a). *${session.name}*! ☀️ Que tenga un buen día.\n\nSoy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera. ¿En qué le puedo ayudar hoy?\n\nPuede consultarme sobre *horarios*, *tutores*, consultar la *asistencia* de su hijo(a) o registrar una *justificación*.`;
-                    await enviarWhatsAppMigo(fromPhone, saludoNuevoDia); sendOk(res);
-                }
             } else {
                 session = { state: 'START', phone: fromPhone, lastActiveDate: todayDateStr };
                 await sessionRef.set({
@@ -267,8 +309,8 @@ async function handleWebhook(req, res) {
 
         const input = rawText.trim().toLowerCase();
 
-        // LÓGICA DE RESETEO (CANCELAR / SALIR / HOLA)
-        if ((input === 'cancelar' || input === 'salir' || input === 'menu' || input === 'hola') && session.state !== 'START' && session.state !== 'VERIFIED') {
+        // LÓGICA DE RESETEO (CANCELAR / SALIR / MENU)
+        if ((input === 'cancelar' || input === 'salir' || input === 'menu' || input === 'menú') && session.state !== 'START') {
             console.log(`🏠 [RESET] Usuario ${fromPhone} solicitó reset via: ${input}`);
             await sessionRef.set({ 
                 state: 'VERIFIED', 
@@ -282,21 +324,24 @@ async function handleWebhook(req, res) {
                 kidsList: admin.firestore.FieldValue.delete(),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
-            await enviarWhatsAppMigo(fromPhone, "✅ Trámite cancelado. He regresado al menú principal. ¿En qué más puedo ayudarte?"); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, "✅ Trámite cancelado. He regresado al menú principal. ¿En qué más puedo ayudarte?");
+            return sendOk(res, 'reset ok');
         }
 
         // --- ESTADO 1: SOLICITAR DNI ---
         if (session.state === 'START') {
             const welcomeMsg = "¡Hola! 🛡️ Soy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera.\n\nPara ayudarte con cualquier trámite o información, por favor bríndame tu número de **DNI**.";
             await enviarWhatsAppMigo(fromPhone, welcomeMsg);
-            await sessionRef.set({ state: 'AWAITING_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() }); sendOk(res);
+            await sessionRef.set({ state: 'AWAITING_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+            return sendOk(res, 'awaiting dni');
         }
 
         // --- ESTADO 2: VALIDAR DNI CON RENIEC (MIGO) ---
         if (session.state === 'AWAITING_DNI') {
             const dni = rawText.trim().replace(/\D/g, '');
             if (dni.length !== 8) {
-                await enviarWhatsAppMigo(fromPhone, "⚠️ El DNI debe tener 8 dígitos. Por favor, envíalo de nuevo."); sendOk(res);
+                await enviarWhatsAppMigo(fromPhone, "⚠️ El DNI debe tener 8 dígitos. Por favor, envíalo de nuevo.");
+                return sendOk(res, 'invalid dni length');
             }
 
             const dniRes = await fetch(`https://api.migo.pe/api/v2/dni/${dni}`, {
@@ -312,7 +357,7 @@ async function handleWebhook(req, res) {
 
             if (dniData.success) {
                 const fullName = dniData.nombre;
-                const greetMsg = `Hola, Sr(a). *${fullName}*. ✅ Identidad verificada.\n\nSoy *Genarito*. ¿En qué puedo ayudarte? Puedes preguntarme por tutores, horarios o incluso puedes enviarme una *justificación* si tu hijo(a) no asistió hoy.`;
+                const greetMsg = `¡Hola, Sr(a). *${fullName}*! ✅ Identidad verificada.\n\nSoy *Genarito*, Asistente Virtual de la I.E.E. Genaro Herrera.\n\n¿En qué puedo ayudarte hoy?\n• Consultar *Tutores* o *Horarios* (ej: "¿Quién es el tutor de 1A?")\n• Registrar una *Justificación* (escribe *"justificar"*)\n• Consultar *Asistencia* (escribe *"asistencia"*)\n• Consultar costos de trámites (escribe *"tarifario"*)`;
                 await enviarWhatsAppMigo(fromPhone, greetMsg);
                 
                 await sessionRef.set({ 
@@ -324,55 +369,73 @@ async function handleWebhook(req, res) {
                 });
             } else {
                 await enviarWhatsAppMigo(fromPhone, "❌ No pudimos validar ese DNI. Por favor, asegúrate de que sea correcto e inténtalo de nuevo.");
-            } sendOk(res);
+            }
+            return sendOk(res, 'dni processed');
         }
 
-        // --- ESTADO 3: ATENCIÓN CON IA (GEMINI) ---
+        // --- ESTADO 3: ATENCIÓN AL USUARIO VERIFICADO ---
         if (session.state === 'VERIFIED') {
-            
-            if (Date.now() - aiMemoryCache.lastFetch > 3600000) {
-                let staffText = "TUTORES 2026:\n";
-                const staffSnap = await db.collection('staff_assignments').get();
-                staffSnap.forEach(d => {
-                    const t = d.data();
-                    staffText += `${t.grade}${t.section}: ${t.teacherName} (${t.phone || 'Sin número'})\n`;
-                });
+            await refreshCacheIfNeeded();
 
-                let feesText = "\nCOSTOS DE TRÁMITES (TARIFARIO 2026):\n";
-                const feesSnap = await db.collection('administrative_fees').get();
-                feesSnap.forEach(d => {
-                    const f = d.data();
-                    feesText += `- ${f.name}: S/ ${f.price}. ${f.notes}\n`;
-                });
-
-                let schedText = "\nHORARIOS ACADÉMICOS (PROFESORES POR AULA):\n";
-                const schedSnap = await db.collection('schedules').get();
-                schedSnap.forEach(d => {
-                    const s = d.data();
-                    schedText += `${s.grade}${s.section} | Curso: ${s.subject} -> Docente: ${s.teacherName}\n`;
-                });
-
-                aiMemoryCache.compiledContext = staffText + feesText + schedText;
-                aiMemoryCache.lastFetch = Date.now();
-                console.log("🔄 Caché Global de IA actualizado desde Firestore.");
+            const saludos = ['hola', 'buenos dias', 'buenos días', 'buenas', 'que tal', 'qué tal', 'buenas tardes', 'buenas noches', 'genarito', 'buen dia', 'buen día', 'ayuda', 'inicio'];
+            if (saludos.includes(input)) {
+                const saludoMsg = `¡Hola de nuevo, Sr(a). *${session.name || ''}*! ☀️\n\nSoy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera. ¿En qué le puedo ayudar hoy?\n\n• Consultar *Tutores* o *Horarios* (ej: *"¿Quién es el tutor de 1A?"*)\n• Registrar una *Justificación* (escribe *"justificar"*)\n• Consultar *Asistencia* (escribe *"asistencia"*)\n• Consultar costos de trámites (escribe *"tarifario"*)\n\n¿Qué información necesita?`;
+                await enviarWhatsAppMigo(fromPhone, saludoMsg);
+                return sendOk(res, 'saludo ok');
             }
 
+            // Justificaciones
             if (rawText.toLowerCase().includes('justificar') || rawText.toLowerCase().includes('justificación') || rawText.toLowerCase().includes('justificacion')) {
                 await sessionRef.set({ 
                     state: 'AWAITING_JUSTIFICATION_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
-                await enviarWhatsAppMigo(fromPhone, "Perfecto. 📝 Vamos a registrar una justificación.\n\nPor favor, bríndame el **DNI del estudiante** que deseas justificar:"); sendOk(res);
+                await enviarWhatsAppMigo(fromPhone, "Perfecto. 📝 Vamos a registrar una justificación.\n\nPor favor, bríndame el **DNI del estudiante** que deseas justificar:");
+                return sendOk(res, 'awaiting justification dni');
             }
 
+            // Asistencia
             if (rawText.toLowerCase().includes('asistencia') || rawText.toLowerCase().includes('asistio') || rawText.toLowerCase().includes('asistió')) {
                 await sessionRef.set({ 
                     state: 'AWAITING_ATTENDANCE_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
-                await enviarWhatsAppMigo(fromPhone, "Perfecto. 🛡️ Para consultar la asistencia, por favor bríndame el **DNI del estudiante**:"); sendOk(res);
+                await enviarWhatsAppMigo(fromPhone, "Perfecto. 🛡️ Para consultar la asistencia, por favor bríndame el **DNI del estudiante**:");
+                return sendOk(res, 'awaiting attendance dni');
             }
 
+            // Tarifario directo
+            if (input.includes('tarifario') || input.includes('costo') || input.includes('costos') || input.includes('precio') || input.includes('precios') || input.includes('tramite') || input.includes('trámite')) {
+                let textFees = "📋 *TARIFARIO DE TRÁMITES INSTITUCIONALES (2026):*\n\n";
+                if (aiMemoryCache.feesList && aiMemoryCache.feesList.length > 0) {
+                    aiMemoryCache.feesList.forEach(f => {
+                        textFees += `• *${f.name}*: S/ ${f.price}${f.notes ? ' (' + f.notes + ')' : ''}\n`;
+                    });
+                } else {
+                    textFees += "• Certificado de Estudios: S/ 10.00\n• Constancia de Matrícula: Gratuito\n• Traslado de Matrícula: S/ 15.00\n";
+                }
+                textFees += "\n¿Deseas ayuda con algún trámite específico?";
+                await enviarWhatsAppMigo(fromPhone, textFees);
+                return sendOk(res, 'tarifario direct');
+            }
+
+            // Consulta directa de Tutores
+            if (input.includes('tutor') || input.includes('tutores') || input.includes('tutora')) {
+                const matchGrade = input.match(/([1-5])\s*(?:grado|°|º)?\s*([a-g])/i);
+                if (matchGrade) {
+                    const gradeNum = matchGrade[1];
+                    const sec = matchGrade[2].toUpperCase();
+                    const found = aiMemoryCache.staffList.find(t => String(t.grade).includes(gradeNum) && String(t.section).toUpperCase() === sec);
+                    if (found) {
+                        const r = `🎓 El tutor de *${gradeNum}° "${sec}"* es el/la docente *${found.teacherName}*${found.phone ? ' (Tel: ' + found.phone + ')' : ''}.`;
+                        await enviarWhatsAppMigo(fromPhone, r);
+                        return sendOk(res, 'tutor found');
+                    }
+                }
+            }
+
+            // Consulta con Gemini AI
+            let responseAI = "";
             const prompt = `
                 Eres *Genarito*, el Asistente Virtual oficial de la I.E.E. Genaro Herrera (IEE G.H.).
                 Tu objetivo es ayudar a padres y alumnos con información exacta sobre horarios, docentes y trámites.
@@ -396,28 +459,31 @@ async function handleWebhook(req, res) {
                 PREGUNTA DEL USUARIO: ${rawText}
             `;
 
-            console.log("📝 Consultando Gemini Flash Lite...");
-            let responseAI = "Lo siento, Genarito tiene un problema momentáneo. Intenta de nuevo en unos minutos.";
+            if (GEMINI_API_KEY && GEMINI_API_KEY.length > 10) {
+                try {
+                    console.log("📝 Consultando Gemini Flash...");
+                    const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [{ parts: [{ text: prompt }] }]
+                        })
+                    });
 
-            try {
-                const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        contents: [{ parts: [{ text: prompt }] }]
-                    })
-                });
-
-                const aiData = await aiResponse.json();
-                if (aiData.candidates && aiData.candidates[0] && aiData.candidates[0].content) {
-                    responseAI = aiData.candidates[0].content.parts[0].text;
-                } else if (aiData.error) {
-                    console.error("❌ Error de Gemini API:", aiData.error);
-                    responseAI = "Genarito está procesando varias solicitudes. Por favor, reenvía tu mensaje en un minuto.";
+                    const aiData = await aiResponse.json();
+                    if (aiData.candidates && aiData.candidates[0] && aiData.candidates[0].content) {
+                        responseAI = aiData.candidates[0].content.parts[0].text;
+                    } else if (aiData.error) {
+                        console.error("❌ Error de Gemini API:", aiData.error);
+                    }
+                } catch (aiErr) {
+                    console.error("❌ Error fetch Gemini:", aiErr.message);
                 }
-            } catch (aiErr) {
-                console.error("❌ Error fetch Gemini:", aiErr.message);
-                responseAI = "Error momentáneo de conexión con el cerebro de Genarito.";
+            }
+
+            // Fallback inteligente si no hay respuesta de Gemini
+            if (!responseAI) {
+                responseAI = `Hola, Sr(a). *${session.name || ''}*. Puedo ayudarte con las siguientes consultas del colegio:\n\n• *Tutores y Horarios*: Escribe por ejemplo *"¿Quién es el tutor de 1A?"* o *"horario de 2B"*\n• *Justificaciones*: Escribe *"justificar"*\n• *Asistencia*: Escribe *"asistencia"*\n• *Costos de Trámites*: Escribe *"tarifario"*\n\n¿De qué grado o trámite deseas consultar?`;
             }
 
             let newHistory = (session.chatHistory || "") + `\nUsuario: ${rawText}\nBot: ${responseAI}\n`;
@@ -429,7 +495,8 @@ async function handleWebhook(req, res) {
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
 
-            await enviarWhatsAppMigo(fromPhone, responseAI); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, responseAI);
+            return sendOk(res, 'ai responded');
         }
 
         // --- FLUJO DE JUSTIFICACIONES ---
@@ -449,7 +516,8 @@ async function handleWebhook(req, res) {
             }
 
             if (studentSnap.empty) {
-                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente."); sendOk(res);
+                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente:");
+                return sendOk(res, 'student not found');
             }
 
             const s = studentSnap.docs[0].data();
@@ -467,7 +535,8 @@ async function handleWebhook(req, res) {
             }, { merge: true });
 
             const msj = `He encontrado a:\n👤 *${studentName}*\n🎓 *${studentGrade} "${studentSection}"*\n\n¿Es correcto? (Responde con **Sí** o **No**)`;
-            await enviarWhatsAppMigo(fromPhone, msj); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, msj);
+            return sendOk(res, 'confirming student');
         }
 
         if (session.state === 'CONFIRMING_JUSTIFICATION_STUDENT') {
@@ -484,33 +553,22 @@ async function handleWebhook(req, res) {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
                 }, { merge: true });
                 await enviarWhatsAppMigo(fromPhone, "Entendido. Por favor, bríndame el **DNI correcto** del estudiante:");
-            } sendOk(res);
+            }
+            return sendOk(res, 'date confirmation processed');
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_DATE') {
             let targetDate = "";
-            const input = rawText.toLowerCase().trim();
+            const inputDate = rawText.toLowerCase().trim();
             const now = new Date();
             
-            if (input === 'hoy') {
+            if (inputDate === 'hoy') {
                 targetDate = getFormattedDate(now);
-            } else if (input === 'ayer') {
+            } else if (inputDate === 'ayer') {
                 const yesterday = new Date(now.getTime() - 86400000);
                 targetDate = getFormattedDate(yesterday);
             } else {
-                try {
-                    const datePrompt = `Convierte esta descripción de fecha a formato DD/MM/YYYY. Responde ÚNICAMENTE con la fecha resultante o la palabra "ERROR" si no es válida. FECHA: ${rawText}. Hoy es ${getFormattedDate(now)}`;
-                    const aiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ contents: [{ parts: [{ text: datePrompt }] }] })
-                    });
-                    const aiData = await aiResp.json();
-                    const parsed = aiData.candidates[0].content.parts[0].text.trim();
-                    targetDate = (parsed === "ERROR" || !parsed.includes('/')) ? getFormattedDate(now) : parsed;
-                } catch (e) {
-                    targetDate = getFormattedDate(now);
-                }
+                targetDate = getFormattedDate(now);
             }
 
             await sessionRef.set({ 
@@ -518,7 +576,8 @@ async function handleWebhook(req, res) {
                 justificationDate: targetDate,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
-            await enviarWhatsAppMigo(fromPhone, `Entendido, para el día **${targetDate}**. Ahora, por favor escribe el **motivo** de la inasistencia:`); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, `Entendido, para el día **${targetDate}**. Ahora, por favor escribe el **motivo** de la inasistencia:`);
+            return sendOk(res, 'reason requested');
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_REASON') {
@@ -528,7 +587,8 @@ async function handleWebhook(req, res) {
                 justificationReason: reason,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
-            await enviarWhatsAppMigo(fromPhone, "✅ Motivo registrado. Por último, si tienes una **foto de la evidencia** (receta médica, constancia, etc.), envíala ahora.\n\nSi no tienes una foto, solo escribe la palabra: **Listo**."); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, "✅ Motivo registrado. Por último, si tienes una **foto de la evidencia** (receta médica, constancia, etc.), envíala ahora.\n\nSi no tienes una foto, solo escribe la palabra: **Listo**.");
+            return sendOk(res, 'evidence requested');
         }
 
         if (session.state === 'AWAITING_JUSTIFICATION_EVIDENCE') {
@@ -548,7 +608,7 @@ async function handleWebhook(req, res) {
                 parentPhone: fromPhone,
                 parentDni: session.dni,
                 parentName: session.name,
-                assistant: 'Genarito (Bot Render)',
+                assistant: 'Genarito Cloud',
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
                 source: 'whatsapp'
             });
@@ -559,7 +619,8 @@ async function handleWebhook(req, res) {
             }, { merge: true });
 
             const msjFinal = `⭐ ¡Listo! Hemos recibido la justificación de *${session.targetStudentName}*.\n\nLa Coordinación de TOE revisará la información. Te avisaremos por este medio cuando sea aprobada. 🛡️`;
-            await enviarWhatsAppMigo(fromPhone, msjFinal); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, msjFinal);
+            return sendOk(res, 'justification completed');
         }
 
         // --- FLUJO DE CONSULTA DE ASISTENCIA ---
@@ -577,7 +638,8 @@ async function handleWebhook(req, res) {
             }
 
             if (studentSnap.empty) {
-                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente."); sendOk(res);
+                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente:");
+                return sendOk(res, 'attendance student not found');
             }
 
             const s = studentSnap.docs[0].data();
@@ -590,7 +652,8 @@ async function handleWebhook(req, res) {
             }, { merge: true });
 
             const msj = `He encontrado a: *${studentName}*.\n\n¿Qué información deseas?\n\n1. Ver reporte de asistencia QR (Hoy/Ayer).\n2. Ayuda para instalar la App en mi celular.`;
-            await enviarWhatsAppMigo(fromPhone, msj); sendOk(res);
+            await enviarWhatsAppMigo(fromPhone, msj);
+            return sendOk(res, 'attendance options sent');
         }
 
         if (session.state === 'AWAITING_ATTENDANCE_OPTION') {
@@ -649,11 +712,14 @@ async function handleWebhook(req, res) {
                 await sessionRef.set({ state: 'VERIFIED' }, { merge: true });
             } else {
                 await enviarWhatsAppMigo(fromPhone, "⚠️ Por favor, elige una opción válida: *1* para asistencia o *2* para ayuda con la App.");
-            } sendOk(res);
+            }
+            return sendOk(res, 'attendance option finished');
         }
 
+        return sendOk(res, 'end reached');
     } catch (error) {
         console.error('❌ Error en procesamiento de Webhook:', error.message);
+        return sendOk(res, 'error caught');
     }
 }
 
