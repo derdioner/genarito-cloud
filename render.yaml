@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: genarito-bot
+    env: node
+    plan: free
+    region: ohio
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: MIGO_INSTANCE
+        value: eea35323-c978-443c-b00d-6ba5ee3ddc9b
+      - key: MIGO_API_KEY
+        value: EB08E3C1-0DF4-48DD-9EB5-19D26053D94A
+      - key: MIGO_DNI_TOKEN
+        value: CSqZeeppmaJm4sxZUsSIUerIcz61PPFnmuOsWyq6GSybBWf0cN0wW7QKaF1u
+      - key: GEMINI_API_KEY
+        value: AIzaSyCv0eXHXTr6rf9cqRDuI79P5CZJngXcEXE
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
