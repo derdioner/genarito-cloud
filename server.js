@@ -419,19 +419,35 @@ async function handleWebhook(req, res) {
                 return sendOk(res, 'tarifario direct');
             }
 
-            // Consulta directa de Tutores
-            if (input.includes('tutor') || input.includes('tutores') || input.includes('tutora')) {
-                const matchGrade = input.match(/([1-5])\s*(?:grado|°|º)?\s*([a-g])/i);
-                if (matchGrade) {
-                    const gradeNum = matchGrade[1];
-                    const sec = matchGrade[2].toUpperCase();
-                    const found = aiMemoryCache.staffList.find(t => String(t.grade).includes(gradeNum) && String(t.section).toUpperCase() === sec);
-                    if (found) {
-                        const r = `🎓 El tutor de *${gradeNum}° "${sec}"* es el/la docente *${found.teacherName}*${found.phone ? ' (Tel: ' + found.phone + ')' : ''}.`;
-                        await enviarWhatsAppMigo(fromPhone, r);
-                        return sendOk(res, 'tutor found');
-                    }
+            // Si el usuario escribe solo "tutor" o "tutores" sin grado
+            if (input === 'tutor' || input === 'tutores' || input === 'tutora' || input === 'quien es el tutor' || input === 'quién es el tutor') {
+                const listMsg = `🎓 *CONSULTA DE TUTORES 2026*\n\nPor favor, escribe el aula que deseas consultar. Por ejemplo:\n• *1A*, *2B*, *3C*, *4B*, *5A*\n\n¿De qué grado y sección necesitas el tutor?`;
+                await enviarWhatsAppMigo(fromPhone, listMsg);
+                return sendOk(res, 'ask grade for tutor');
+            }
+
+            // Consulta directa de Grado y Sección (ej: "4B", "tutor de 4B", "4 b", "horario de 4B")
+            const matchGrade = input.match(/(?:tutor(?:a)?\s*(?:de)?\s*)?([1-5])\s*(?:grado|°|º|\/)?\s*([a-g])\b/i);
+            if (matchGrade) {
+                const gradeNum = matchGrade[1];
+                const sec = matchGrade[2].toUpperCase();
+                const foundTutor = aiMemoryCache.staffList.find(t => String(t.grade).trim() === gradeNum && String(t.section).trim().toUpperCase() === sec);
+                
+                let answer = `🎓 *Información de ${gradeNum}° "${sec}" (IEE Genaro Herrera):*\n\n`;
+                if (foundTutor) {
+                    answer += `👤 *Tutor(a):* ${foundTutor.teacherName}\n📞 *Teléfono:* ${foundTutor.phone || 'No registrado'}\n\n`;
                 }
+
+                const courses = aiMemoryCache.schedulesList.filter(s => String(s.grade).trim() === gradeNum && String(s.section).trim().toUpperCase() === sec);
+                if (courses.length > 0) {
+                    answer += `📚 *Docentes del Aula:*\n`;
+                    courses.slice(0, 10).forEach(c => {
+                        answer += `• *${c.subject}*: ${c.teacherName}\n`;
+                    });
+                }
+                answer += `\n¿Deseas consultar otro grado o registrar una justificación?`;
+                await enviarWhatsAppMigo(fromPhone, answer);
+                return sendOk(res, 'grade direct info');
             }
 
             // Consulta con Gemini AI
