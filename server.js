@@ -118,6 +118,14 @@ function recordIncoming(req, note = '') {
     if (requestLogs.length > 50) requestLogs.pop();
 }
 
+// Middleware de diagnóstico: registrar todo tráfico (excepto /health para no saturar)
+app.use((req, res, next) => {
+    if (req.path !== '/health') {
+        recordIncoming(req, `HTTP ${req.method} ${req.originalUrl || req.path}`);
+    }
+    next();
+});
+
 // ==========================================
 //   RUTAS DE SALUD Y VERIFICACIÓN
 // ==========================================
@@ -739,11 +747,12 @@ async function handleWebhook(req, res) {
     }
 }
 
-// Escuchar en todas las variantes posibles de endpoint
-app.all('/webhook/migo', handleWebhook);
-app.all('/webhook', handleWebhook);
-app.all('/api/webhook', handleWebhook);
-app.post('/', handleWebhook);
+// Escuchar en todas las variantes posibles de endpoint y subrutas (incluyendo /messages-upsert)
+app.all('/webhook/migo*', handleWebhook);
+app.all('/webhook*', handleWebhook);
+app.all('/api/webhook*', handleWebhook);
+app.all('/messages-upsert*', handleWebhook);
+app.post('*', handleWebhook);
 
 if (!process.env.VERCEL) {
     app.listen(PORT, () => {
