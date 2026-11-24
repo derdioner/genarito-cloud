@@ -202,6 +202,68 @@ async function refreshCacheIfNeeded() {
     }
 }
 
+// Búsqueda inteligente de estudiante en Firestore por DNI o texto que contenga DNI
+async function buscarEstudianteEnBD(rawInput) {
+    if (!db || !rawInput) return null;
+
+    const dniMatch = String(rawInput).match(/\b\d{8}\b/);
+    const candidateDni = dniMatch ? dniMatch[0] : String(rawInput).replace(/\D/g, '');
+
+    if (candidateDni && candidateDni.length === 8) {
+        // A. Búsqueda directa por ID de documento (clave primaria)
+        try {
+            const docRef = await db.collection('students').doc(candidateDni).get();
+            if (docRef.exists) {
+                const data = docRef.data();
+                return {
+                    id: docRef.id,
+                    dni: candidateDni,
+                    studentName: data.studentName || data.name || data.n || "Estudiante",
+                    grade: data.grade || data.g || "",
+                    section: data.section || data.s || "",
+                    raw: data
+                };
+            }
+        } catch (e) {
+            console.error("Error en doc lookup:", e.message);
+        }
+
+        // B. Búsqueda por campos studentDni, dni, id (string y number)
+        const dniNum = parseInt(candidateDni, 10);
+        const queries = [
+            db.collection('students').where('studentDni', '==', candidateDni).limit(1).get(),
+            db.collection('students').where('dni', '==', candidateDni).limit(1).get(),
+            db.collection('students').where('id', '==', candidateDni).limit(1).get()
+        ];
+        if (!isNaN(dniNum)) {
+            queries.push(db.collection('students').where('studentDni', '==', dniNum).limit(1).get());
+            queries.push(db.collection('students').where('id', '==', dniNum).limit(1).get());
+        }
+
+        try {
+            const results = await Promise.all(queries);
+            for (const snap of results) {
+                if (!snap.empty) {
+                    const doc = snap.docs[0];
+                    const data = doc.data();
+                    return {
+                        id: doc.id,
+                        dni: candidateDni,
+                        studentName: data.studentName || data.name || data.n || "Estudiante",
+                        grade: data.grade || data.g || "",
+                        section: data.section || data.s || "",
+                        raw: data
+                    };
+                }
+            }
+        } catch (e) {
+            console.error("Error en query lookup:", e.message);
+        }
+    }
+
+    return null;
+}
+
 // Manejador centralizado para webhooks (acepta POST en /webhook/migo, /webhook y /)
 async function handleWebhook(req, res) {
     recordIncoming(req, 'Incoming webhook');
@@ -338,46 +400,117 @@ async function handleWebhook(req, res) {
 
         // --- ESTADO 1: SOLICITAR DNI ---
         if (session.state === 'START') {
-            const welcomeMsg = "¡Hola! 🛡️ Soy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera.\n\nPara ayudarte con cualquier trámite o información, por favor bríndame tu número de **DNI**.";
+            // Si el mensaje inicial ya contiene un DNI de estudiante o solicitud de justificación
+            const detectedStudent = await buscarEstudianteEnBD(rawText);
+            if (detectedStudent) {
+                console.log(`🎯 Estudiante detectado en mensaje inicial: ${detectedStudent.studentName}`);
+                await sessionRef.set({
+                    state: 'CONFIRMING_JUSTIFICATION_STUDENT',
+                    targetStudentDni: detectedStudent.dni,
+                    targetStudentName: detectedStudent.studentName,
+                    targetStudentGrade: detectedStudent.grade,
+                    targetStudentSection: detectedStudent.section,
+                    lastActiveDate: todayDateStr,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+
+                const msj = `¡Hola! 🛡️ Soy *Genarito*, Asistente Virtual de la I.E.E. Genaro Herrera.\n\nHe identificado a tu menor hijo(a):\n👤 *${detectedStudent.studentName}*\n🎓 *${detectedStudent.grade} "${detectedStudent.section}"*\n\n¿Deseas registrar una justificación de inasistencia para él/ella? (Responde con **Sí** o **No**)`;
+                await enviarWhatsAppMigo(fromPhone, msj);
+                return sendOk(res, 'student detected at start');
+            }
+
+            const welcomeMsg = "¡Hola! 🛡️ Soy *Genarito*, el Asistente Virtual de la I.E.E. Genaro Herrera.\n\nPara ayudarte con cualquier trámite o información, por favor bríndame tu número de **DNI** (o el DNI del estudiante):";
             await enviarWhatsAppMigo(fromPhone, welcomeMsg);
             await sessionRef.set({ state: 'AWAITING_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
             return sendOk(res, 'awaiting dni');
         }
 
-        // --- ESTADO 2: VALIDAR DNI CON RENIEC (MIGO) ---
+        // --- ESTADO 2: VALIDAR DNI CON ALUMNO / RENIEC ---
         if (session.state === 'AWAITING_DNI') {
-            const dni = rawText.trim().replace(/\D/g, '');
-            if (dni.length !== 8) {
-                await enviarWhatsAppMigo(fromPhone, "⚠️ El DNI debe tener 8 dígitos. Por favor, envíalo de nuevo.");
-                return sendOk(res, 'invalid dni length');
+            const dniMatch = rawText.match(/\b\d{8}\b/);
+            const dni = dniMatch ? dniMatch[0] : rawText.trim().replace(/\D/g, '');
+
+            if (!dni || dni.length !== 8) {
+                if (input.includes('justif') || input.includes('falta')) {
+                    await sessionRef.set({ state: 'AWAITING_JUSTIFICATION_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                    await enviarWhatsAppMigo(fromPhone, "Perfecto. 📝 Vamos a registrar una justificación.\n\nPor favor, bríndame el **DNI de 8 dígitos del estudiante**:");
+                    return sendOk(res, 'switch to justification');
+                }
+                if (input.includes('asist')) {
+                    await sessionRef.set({ state: 'AWAITING_ATTENDANCE_DNI', updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                    await enviarWhatsAppMigo(fromPhone, "Perfecto. 🛡️ Para consultar asistencia, por favor bríndame el **DNI de 8 dígitos del estudiante**:");
+                    return sendOk(res, 'switch to attendance');
+                }
+
+                await enviarWhatsAppMigo(fromPhone, "⚠️ Por favor, indícame un número de **DNI de 8 dígitos** para poder identificarte o buscar al estudiante:");
+                return sendOk(res, 'invalid dni format');
             }
 
-            const dniRes = await fetch(`https://api.migo.pe/api/v2/dni/${dni}`, {
-                method: 'GET',
-                headers: { 
-                    'Authorization': `Bearer ${MIGO_DNI_TOKEN}`, 
-                    'Accept': 'application/json' 
-                }
-            });
-            
-            const dniData = await dniRes.json();
-            console.log("🔍 [API DNI RESPUESTA]:", JSON.stringify(dniData));
-
-            if (dniData.success) {
-                const fullName = dniData.nombre;
-                const greetMsg = `¡Hola, Sr(a). *${fullName}*! ✅ Identidad verificada.\n\nSoy *Genarito*, Asistente Virtual de la I.E.E. Genaro Herrera.\n\n¿En qué puedo ayudarte hoy?\n• Consultar *Tutores* o *Horarios* (ej: "¿Quién es el tutor de 1A?")\n• Registrar una *Justificación* (escribe *"justificar"*)\n• Consultar *Asistencia* (escribe *"asistencia"*)\n• Consultar costos de trámites (escribe *"tarifario"*)`;
+            // 1. Primero verificar si el DNI corresponde a un ESTUDIANTE del colegio en Firestore
+            const student = await buscarEstudianteEnBD(dni);
+            if (student) {
+                console.log(`🎓 DNI corresponde a estudiante: ${student.studentName}`);
+                const greetMsg = `¡Hola! He identificado al estudiante *${student.studentName}* (${student.grade}° "${student.section}"). ✅\n\nSoy *Genarito*, Asistente Virtual de la I.E.E. Genaro Herrera.\n\n¿En qué puedo ayudarte hoy?\n• Registrar una *Justificación* (escribe *"justificar"*)\n• Consultar *Asistencia* (escribe *"asistencia"*)\n• Consultar *Tutores* o *Horarios* (ej: *"¿Quién es el tutor de ${student.grade}${student.section}?"*)\n• Consultar costos de trámites (escribe *"tarifario"*)`;
                 await enviarWhatsAppMigo(fromPhone, greetMsg);
-                
-                await sessionRef.set({ 
-                    state: 'VERIFIED', 
-                    dni: dni, 
+
+                await sessionRef.set({
+                    state: 'VERIFIED',
+                    dni: dni,
+                    name: student.studentName,
+                    targetStudentDni: dni,
+                    targetStudentName: student.studentName,
+                    targetStudentGrade: student.grade,
+                    targetStudentSection: student.section,
+                    lastActiveDate: todayDateStr,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                return sendOk(res, 'student dni verified');
+            }
+
+            // 2. Si no es estudiante, consultar en RENIEC (Migo API) por el apoderado
+            let fullName = "";
+            try {
+                const dniRes = await fetch(`https://api.migo.pe/api/v2/dni/${dni}`, {
+                    method: 'GET',
+                    headers: { 
+                        'Authorization': `Bearer ${MIGO_DNI_TOKEN}`, 
+                        'Accept': 'application/json' 
+                    }
+                });
+                const dniData = await dniRes.json();
+                console.log("🔍 [API DNI RESPUESTA]:", JSON.stringify(dniData));
+                if (dniData.success && dniData.nombre) {
+                    fullName = dniData.nombre;
+                }
+            } catch (apiErr) {
+                console.error("⚠️ Error consultando API Migo DNI:", apiErr.message);
+            }
+
+            if (fullName) {
+                const greetMsg = `¡Hola, Sr(a). *${fullName}*! ✅ Identidad verificada.\n\nSoy *Genarito*, Asistente Virtual de la I.E.E. Genaro Herrera.\n\n¿En qué puedo ayudarte hoy?\n• Registrar una *Justificación* (escribe *"justificar"*)\n• Consultar *Asistencia* (escribe *"asistencia"*)\n• Consultar *Tutores* o *Horarios* (ej: "¿Quién es el tutor de 1A?")\n• Consultar costos de trámites (escribe *"tarifario"*)`;
+                await enviarWhatsAppMigo(fromPhone, greetMsg);
+
+                await sessionRef.set({
+                    state: 'VERIFIED',
+                    dni: dni,
                     name: fullName,
                     lastActiveDate: todayDateStr,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp() 
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
             } else {
-                await enviarWhatsAppMigo(fromPhone, "❌ No pudimos validar ese DNI. Por favor, asegúrate de que sea correcto e inténtalo de nuevo.");
+                // Fallback: Aceptar el DNI de 8 dígitos para no bloquear nunca al apoderado
+                const greetMsg = `¡Hola! ✅ DNI *${dni}* registrado correctamente.\n\nSoy *Genarito*, Asistente Virtual de la I.E.E. Genaro Herrera.\n\n¿En qué puedo ayudarte hoy?\n• Registrar una *Justificación* (escribe *"justificar"*)\n• Consultar *Asistencia* (escribe *"asistencia"*)\n• Consultar *Tutores* o *Horarios* (ej: "¿Quién es el tutor de 1A?")\n• Consultar costos de trámites (escribe *"tarifario"*)`;
+                await enviarWhatsAppMigo(fromPhone, greetMsg);
+
+                await sessionRef.set({
+                    state: 'VERIFIED',
+                    dni: dni,
+                    name: 'Familia GH',
+                    lastActiveDate: todayDateStr,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
             }
+
             return sendOk(res, 'dni processed');
         }
 
@@ -394,6 +527,16 @@ async function handleWebhook(req, res) {
 
             // Justificaciones
             if (rawText.toLowerCase().includes('justificar') || rawText.toLowerCase().includes('justificación') || rawText.toLowerCase().includes('justificacion')) {
+                if (session.targetStudentDni && session.targetStudentName) {
+                    await sessionRef.set({ 
+                        state: 'AWAITING_JUSTIFICATION_DATE',
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp() 
+                    }, { merge: true });
+                    const gradSec = (session.targetStudentGrade || session.targetStudentSection) ? ` (${session.targetStudentGrade}° "${session.targetStudentSection}")` : '';
+                    await enviarWhatsAppMigo(fromPhone, `Perfecto. 📝 Vamos a registrar la justificación de *${session.targetStudentName}*${gradSec}.\n\n¿Para qué fecha es la justificación? 📅\n\nResponde con **Hoy**, **Ayer** o escribe la fecha específica (ej: 24 de noviembre):`);
+                    return sendOk(res, 'justification date direct');
+                }
+
                 await sessionRef.set({ 
                     state: 'AWAITING_JUSTIFICATION_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
@@ -404,6 +547,16 @@ async function handleWebhook(req, res) {
 
             // Asistencia
             if (rawText.toLowerCase().includes('asistencia') || rawText.toLowerCase().includes('asistio') || rawText.toLowerCase().includes('asistió')) {
+                if (session.targetStudentDni && session.targetStudentName) {
+                    await sessionRef.set({ 
+                        state: 'AWAITING_ATTENDANCE_OPTION',
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp() 
+                    }, { merge: true });
+                    const msj = `He encontrado a: *${session.targetStudentName}*.\n\n¿Qué información deseas?\n\n1. Ver reporte de asistencia QR (Hoy/Ayer).\n2. Ayuda para instalar la App en mi celular.`;
+                    await enviarWhatsAppMigo(fromPhone, msj);
+                    return sendOk(res, 'attendance options direct');
+                }
+
                 await sessionRef.set({ 
                     state: 'AWAITING_ATTENDANCE_DNI',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp() 
@@ -525,33 +678,21 @@ async function handleWebhook(req, res) {
 
         // --- FLUJO DE JUSTIFICACIONES ---
         if (session.state === 'AWAITING_JUSTIFICATION_DNI') {
-            const dni = rawText.trim().replace(/\D/g, '');
-            console.log(`🔍 Buscando estudiante DNI: ${dni}`);
+            console.log(`🔍 Buscando estudiante para justificación desde input: "${rawText}"`);
+            const s = await buscarEstudianteEnBD(rawText);
 
-            let studentSnap = await db.collection('students').where('studentDni', '==', dni).get();
-            if (studentSnap.empty) studentSnap = await db.collection('students').where('dni', '==', dni).get();
-            if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dni).get();
-            if (studentSnap.empty) {
-                const dniNum = parseInt(dni);
-                if (!isNaN(dniNum)) {
-                    studentSnap = await db.collection('students').where('studentDni', '==', dniNum).get();
-                    if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dniNum).get();
-                }
-            }
-
-            if (studentSnap.empty) {
-                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente:");
+            if (!s) {
+                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI en la base del colegio. Por favor, verifica el número de 8 dígitos y envíalo nuevamente:");
                 return sendOk(res, 'student not found');
             }
 
-            const s = studentSnap.docs[0].data();
-            const studentName = s.studentName || s.name || s.n || "Estudiante";
-            const studentGrade = s.grade || s.g || "";
-            const studentSection = s.section || s.s || "";
+            const studentName = s.studentName;
+            const studentGrade = s.grade;
+            const studentSection = s.section;
 
             await sessionRef.set({ 
                 state: 'CONFIRMING_JUSTIFICATION_STUDENT',
-                targetStudentDni: dni,
+                targetStudentDni: s.dni,
                 targetStudentName: studentName,
                 targetStudentGrade: studentGrade,
                 targetStudentSection: studentSection,
@@ -649,28 +790,18 @@ async function handleWebhook(req, res) {
 
         // --- FLUJO DE CONSULTA DE ASISTENCIA ---
         if (session.state === 'AWAITING_ATTENDANCE_DNI') {
-            const dni = rawText.trim().replace(/\D/g, '');
-            let studentSnap = await db.collection('students').where('studentDni', '==', dni).get();
-            if (studentSnap.empty) studentSnap = await db.collection('students').where('dni', '==', dni).get();
-            if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dni).get();
-            if (studentSnap.empty) {
-                const dniNum = parseInt(dni);
-                if (!isNaN(dniNum)) {
-                    studentSnap = await db.collection('students').where('studentDni', '==', dniNum).get();
-                    if (studentSnap.empty) studentSnap = await db.collection('students').where('id', '==', dniNum).get();
-                }
-            }
+            console.log(`🔍 Buscando estudiante para asistencia desde input: "${rawText}"`);
+            const s = await buscarEstudianteEnBD(rawText);
 
-            if (studentSnap.empty) {
-                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI. Por favor, verifícalo y envíalo nuevamente:");
+            if (!s) {
+                await enviarWhatsAppMigo(fromPhone, "😔 No encontré a ningún estudiante con ese DNI en la base del colegio. Por favor, verifica el número de 8 dígitos y envíalo nuevamente:");
                 return sendOk(res, 'attendance student not found');
             }
 
-            const s = studentSnap.docs[0].data();
-            const studentName = s.studentName || s.name || s.n || "Estudiante";
+            const studentName = s.studentName;
             await sessionRef.set({ 
                 state: 'AWAITING_ATTENDANCE_OPTION',
-                targetStudentDni: dni,
+                targetStudentDni: s.dni,
                 targetStudentName: studentName,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp() 
             }, { merge: true });
